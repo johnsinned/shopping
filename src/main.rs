@@ -18,8 +18,8 @@ use parquet::{
 const DAY_MS: i64 = 86_400_000;
 const SESSION_GAP_MS: u32 = 1_800_000;
 const CLICK_REACH_MS: u32 = 7 * 86_400_000;
-const NUM_SHARDS: usize = 256;
-const SHARD_SHIFT: u32 = 8; // log2(NUM_SHARDS)
+const NUM_SHARDS: usize = 512;
+const SHARD_SHIFT: u32 = NUM_SHARDS.trailing_zeros();
 const CHUNK_SIZE: usize = 2 * 1024 * 1024;
 const INVALID_PAYLOAD: u64 = u64::MAX;
 
@@ -112,12 +112,15 @@ fn pack7(s: &[u8]) -> u64 {
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     {
         let len = s.len().min(9);
-        let mut buf = [0u8; 8];
-        let copy_len = len.min(8);
-        unsafe {
-            std::ptr::copy_nonoverlapping(s.as_ptr(), buf.as_mut_ptr(), copy_len);
-        }
-        let be = u64::from_be_bytes(buf);
+        let be = if len >= 8 {
+            // Generated IDs usually occupy eight or nine bytes. Avoid a
+            // zeroed stack buffer and variable-length copy on that hot path.
+            u64::from_be(unsafe { s.as_ptr().cast::<u64>().read_unaligned() })
+        } else {
+            let mut buf = [0u8; 8];
+            buf[..len].copy_from_slice(&s[..len]);
+            u64::from_be_bytes(buf)
+        };
         let hi = unsafe { _pext_u64(be, 0x7F7F_7F7F_7F7F_7F7F) } << 7;
         if len == 9 {
             hi | ((unsafe { *s.get_unchecked(8) } as u64) & 0x7F)
@@ -148,6 +151,15 @@ fn mix64(mut k: u64) -> u64 {
     k = k.wrapping_mul(0xc4ceb9fe1a85ec53);
     k ^= k >> 33;
     k
+}
+
+#[inline(always)]
+fn unmix64(mut key: u64) -> u64 {
+    key ^= key >> 33;
+    key = key.wrapping_mul(0x9cb4b2f8129337db);
+    key ^= key >> 33;
+    key = key.wrapping_mul(0x4f74430c22a54005);
+    key ^ (key >> 33)
 }
 
 #[inline(always)]
@@ -215,6 +227,64 @@ fn parse_2d(s: &[u8], idx: usize) -> Option<u32> {
         Some((d1 as u32) * 10 + (d0 as u32))
     } else {
         None
+    }
+}
+
+/// Gather the eight day/time digits and decode all four pairs together.
+#[inline(always)]
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "ssse3", target_feature = "sse4.1"))))]
+fn parse_day_hms(s: &[u8]) -> Option<(u32, u32, u32, u32)> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+    {
+        // Callers have already checked for a 20- or 25-byte timestamp.
+        let mut digits = unsafe {
+            let tail = _mm_loadu_si128(s.as_ptr().add(4).cast::<__m128i>());
+            let order = _mm_setr_epi8(4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1, -1, -1);
+            _mm_cvtsi128_si64(_mm_shuffle_epi8(tail, order)) as u64
+        };
+        digits = digits.wrapping_sub(0x3030_3030_3030_3030);
+        if ((digits | digits.wrapping_add(0x7676_7676_7676_7676)) & 0x8080_8080_8080_8080) != 0 {
+            return None;
+        }
+        let pairs = (digits.wrapping_mul(2561) >> 8) & 0x00FF_00FF_00FF_00FF;
+        Some(((pairs & 255) as u32, ((pairs >> 16) & 255) as u32,
+              ((pairs >> 32) & 255) as u32, (pairs >> 48) as u32))
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
+    {
+        Some((parse_2d(s, 8)?, parse_2d(s, 11)?, parse_2d(s, 14)?, parse_2d(s, 17)?))
+    }
+}
+
+/// Parse the four decimal pairs together, then use SIMD multiply-adds
+/// to form seconds without four independent scalar digit chains.
+#[inline(always)]
+fn parse_calendar_tail(s: &[u8], base_days: i64, max_day: Option<u32>) -> Option<i64> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3", target_feature = "sse4.1"))]
+    unsafe {
+        let tail = _mm_loadu_si128(s.as_ptr().add(4).cast::<__m128i>());
+        let order = _mm_setr_epi8(4,5,7,8,10,11,13,14,-1,-1,-1,-1,-1,-1,-1,-1);
+        let digits = _mm_sub_epi8(_mm_shuffle_epi8(tail, order), _mm_set1_epi8(b'0' as i8));
+        let pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
+        let day = _mm_extract_epi16(pairs, 0) as i64;
+        if let Some(max_day) = max_day {
+            let valid_digits = _mm_cmpeq_epi8(_mm_subs_epu8(digits, _mm_set1_epi8(9)), _mm_setzero_si128());
+            let excess = _mm_subs_epu16(pairs, _mm_setr_epi16(max_day as i16,23,59,59,32767,32767,32767,32767));
+            if _mm_movemask_epi8(valid_digits) & 255 != 255 || day == 0 || _mm_testz_si128(excess, excess) == 0 {
+                return None;
+            }
+        }
+        let seconds = _mm_madd_epi16(pairs, _mm_setr_epi16(0,3600,60,1,0,0,0,0));
+        let seconds = _mm_cvtsi128_si32(seconds) as i64 + _mm_extract_epi32(seconds,1) as i64;
+        return Some((base_days + day) * DAY_MS + seconds * 1000);
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3", target_feature = "sse4.1")))]
+    {
+        let (day,hour,min,sec) = parse_day_hms(s)?;
+        if let Some(max_day) = max_day {
+            if day == 0 || day > max_day || hour > 23 || min > 59 || sec > 59 { return None; }
+        }
+        Some((base_days + day as i64) * DAY_MS + ((hour * 3600 + min * 60 + sec) as i64) * 1000)
     }
 }
 
@@ -384,20 +454,80 @@ fn parse_csv_line_fallback<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     Some(out)
 }
 
-#[inline(always)]
-fn get_bit_96(lo: u64, hi: u32, idx: usize) -> u32 {
-    let b_lo = ((lo >> (idx & 63)) & 1) as u32;
-    let b_hi = (hi >> (idx & 31)) & 1;
-    if idx < 64 { b_lo } else { b_hi }
+/// SIMD records keep byte spans, rather than materializing seven fat
+/// pointers before validation. The event decoder loads only fields it uses.
+struct CsvRecord<'a, const N: usize> {
+    line: &'a [u8],
+    spans: [[u8; 2]; N],
 }
 
-/// Unified branchless AVX2 line + CSV field parser using native u64/u32 bitmasks.
-/// Zero branches on line length (<64 vs >=64) and zero branches on quoted vs unquoted fields!
+impl<'a, const N: usize> CsvRecord<'a, N> {
+    #[inline(always)]
+    fn field(&self, index: usize) -> &'a [u8] {
+        let [start, end] = self.spans[index];
+        // Spans are constructed only after delimiter and quote validation.
+        unsafe { std::slice::from_raw_parts(self.line.as_ptr().add(start as usize), (end - start) as usize) }
+    }
+
+    #[inline(always)]
+    fn to_array(&self) -> [&'a [u8]; N] {
+        std::array::from_fn(|index| self.field(index))
+    }
+}
+
+trait EventFields {
+    fn field(&self, index: usize) -> &[u8];
+}
+
+impl EventFields for CsvRecord<'_, 7> {
+    #[inline(always)]
+    fn field(&self, index: usize) -> &[u8] { CsvRecord::field(self, index) }
+}
+
+impl EventFields for [&[u8]; 7] {
+    #[inline(always)]
+    fn field(&self, index: usize) -> &[u8] { self[index] }
+}
+
+/// Bit i is one when an odd number of quotes precedes or includes i.
+#[inline(always)]
+fn quote_prefix(quotes: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+    unsafe {
+        let product = _mm_clmulepi64_si128(_mm_set_epi64x(0, quotes as i64), _mm_set1_epi64x(-1), 0);
+        return _mm_cvtsi128_si64(product) as u64;
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
+    {
+        let mut quotes = quotes;
+        quotes ^= quotes << 1; quotes ^= quotes << 2; quotes ^= quotes << 4;
+        quotes ^= quotes << 8; quotes ^= quotes << 16; quotes ^= quotes << 32;
+        quotes
+    }
+}
+
+/// Quotes must lie on field edges, and every comma/newline must have even
+/// quote parity. Together these require zero quotes or a matched pair in each
+/// field, without checking both boundaries separately for all seven fields.
+#[inline(always)]
+fn valid_quote_masks(q_lo: u64, q_hi: u64, c_lo: u64, c_hi: u64, end_lo: u64, end_hi: u64) -> bool {
+    let delimiters_lo = c_lo | end_lo;
+    let delimiters_hi = c_hi | end_hi;
+    let edges_lo = (c_lo << 1) | (delimiters_lo >> 1) | (delimiters_hi << 63) | 1;
+    let edges_hi = (c_hi << 1) | (c_lo >> 63) | (delimiters_hi >> 1);
+    let parity_lo = quote_prefix(q_lo);
+    let parity_hi = quote_prefix(q_hi) ^ 0u64.wrapping_sub(parity_lo >> 63);
+    ((q_lo & !edges_lo) | (q_hi & !edges_hi)
+        | (parity_lo & delimiters_lo) | (parity_hi & delimiters_hi)) == 0
+}
+
+/// AVX2 line and delimiter scan, with scalar loads for boundary quotes.
+/// Counting all quotes also rejects quotes embedded inside a field.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn try_parse_record_avx2<const N: usize>(
     rem: &[u8],
-) -> Option<(usize, Option<[&[u8]; N]>)> {
+) -> Option<(usize, Option<CsvRecord<'_, N>>)> {
     if rem.len() < 96 {
         return None;
     }
@@ -428,12 +558,14 @@ unsafe fn try_parse_record_avx2<const N: usize>(
             return Some((0, None));
         }
 
-        let (lo_mask, hi_mask) = if len < 64 {
-            ((1u64 << len) - 1, 0u32)
+        let (lo_mask, hi_mask, end_lo, end_hi) = if len < 64 {
+            let end = 1u64 << len;
+            (end - 1, 0u32, end, 0u64)
         } else if len == 64 {
-            (!0u64, 0u32)
+            (!0u64, 0u32, 0, 1)
         } else {
-            (!0u64, (1u32 << (len - 64)) - 1)
+            let end = 1u32 << (len - 64);
+            (!0u64, end - 1, 0, end as u64)
         };
 
         let c0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_comma)) as u32 as u64;
@@ -452,50 +584,49 @@ unsafe fn try_parse_record_avx2<const N: usize>(
         let q_lo = (q0 | (q1 << 32)) & lo_mask;
         let q_hi = q2 & hi_mask;
 
-        let total_quotes = q_lo.count_ones() + q_hi.count_ones();
-        let mut bad_quotes = 0u32;
-        let mut boundary_quotes = 0u32;
-        let mut out = [&[][..]; N];
+        if !valid_quote_masks(q_lo, q_hi as u64, c_lo, c_hi as u64, end_lo, end_hi) {
+            return Some((len, None));
+        }
+        let mut out = [[0u8; 2]; N];
         let mut start = 0usize;
-        let mut k = 0usize;
-
-        while k + 1 < N {
-            let use_lo = c_lo != 0;
-            let end = if use_lo {
-                c_lo.trailing_zeros() as usize
+        #[inline(always)]
+        fn take_comma(lo: &mut u64, hi: &mut u32) -> usize {
+            if *lo != 0 {
+                let end = lo.trailing_zeros() as usize;
+                *lo &= *lo - 1;
+                end
             } else {
-                64 + (c_hi.trailing_zeros() as usize)
-            };
-            if use_lo {
-                c_lo &= c_lo - 1;
-            } else {
-                c_hi &= c_hi - 1;
+                let end = 64 + hi.trailing_zeros() as usize;
+                *hi &= *hi - 1;
+                end
             }
-            let flen = end - start;
-            let qs = if flen > 0 { get_bit_96(q_lo, q_hi, start) } else { 0 };
-            let qe = if flen > 1 { get_bit_96(q_lo, q_hi, end - 1) } else { 0 };
-            bad_quotes |= qs ^ qe;
-            boundary_quotes += qs + qe;
-            let trim = (qs & qe) as usize;
-            out[k] = std::slice::from_raw_parts(ptr.add(start + trim), flen - 2 * trim);
-            start = end + 1;
-            k += 1;
+        }
+        macro_rules! field {
+            ($k:expr) => {{
+                let end = take_comma(&mut c_lo, &mut c_hi);
+                let trim = (*ptr.add(start) == b'"') as usize;
+                out[$k] = [(start + trim) as u8, (end - trim) as u8];
+                start = end + 1;
+            }};
+        }
+        if N == 7 {
+            field!(0);
+            field!(1);
+            field!(2);
+            field!(3);
+            field!(4);
+            field!(5);
+        } else {
+            for k in 0..N - 1 {
+                field!(k);
+            }
         }
         {
-            let flen = len - start;
-            let qs = if flen > 0 { get_bit_96(q_lo, q_hi, start) } else { 0 };
-            let qe = if flen > 1 { get_bit_96(q_lo, q_hi, len - 1) } else { 0 };
-            bad_quotes |= qs ^ qe;
-            boundary_quotes += qs + qe;
-            let trim = (qs & qe) as usize;
-            out[N - 1] = std::slice::from_raw_parts(ptr.add(start + trim), flen - 2 * trim);
+            let trim = (*ptr.add(start) == b'"') as usize;
+            out[N - 1] = [(start + trim) as u8, (len - trim) as u8];
         }
 
-        if bad_quotes == 0 && boundary_quotes == total_quotes {
-            Some((len, Some(out)))
-        } else {
-            Some((len, None))
-        }
+        Some((len, Some(CsvRecord { line: &rem[..len], spans: out })))
     }
 }
 
@@ -511,7 +642,7 @@ fn for_each_csv_record<const N: usize>(chunk: &[u8], mut f: impl FnMut([&[u8]; N
             {
                 pos += line_len + 1;
                 if let Some(fields) = maybe_fields {
-                    f(fields);
+                    f(fields.to_array());
                 }
             } else {
                 let rem = &chunk[pos..];
@@ -682,7 +813,7 @@ impl CanonMap {
                 loop {
                     let dst = unsafe { compact_table.get_unchecked_mut(idx) };
                     if dst.key == 0 {
-                        *dst = entry;
+                        *dst = CanonEntry { key: entry.key, val: mix64(entry.val) };
                         break;
                     }
                     idx = (idx + 1) & compact_mask;
@@ -721,16 +852,17 @@ impl CanonMap {
         let _ = u;
     }
 
+    /// Return the mixed canonical ID directly. The hash is bijective, so it
+    /// remains an exact identity through partitioning and grouping; unmix64
+    /// recovers the original canonical name when output rows are emitted.
     #[inline(always)]
-    fn resolve(&self, u: u64) -> u64 {
-        if self.mask == 1 {
-            return u;
-        }
+    fn resolve_hashed(&self, u: u64) -> u64 {
         let h = mix64(u);
+        if self.mask == 1 { return h; }
         let w_idx = ((h >> 32) as usize) & self.bloom_mask;
         let b_mask = (1u64 << (h & 63)) | (1u64 << ((h >> 6) & 63));
         if (unsafe { *self.bloom.get_unchecked(w_idx) } & b_mask) != b_mask {
-            return u;
+            return h;
         }
         let mut idx = (h as usize) & self.mask;
         loop {
@@ -739,7 +871,7 @@ impl CanonMap {
                 return entry.val;
             }
             if entry.key == 0 {
-                return u;
+                return h;
             }
             idx = (idx + 1) & self.mask;
         }
@@ -954,14 +1086,7 @@ impl Catalog {
         } else {
             return parse_f1(s);
         };
-        let ptr = s.as_ptr();
-        unsafe {
-            let day = ((*ptr.add(8) - b'0') as i64) * 10 + ((*ptr.add(9) - b'0') as i64);
-            let hour = ((*ptr.add(11) - b'0') as i64) * 10 + ((*ptr.add(12) - b'0') as i64);
-            let min = ((*ptr.add(14) - b'0') as i64) * 10 + ((*ptr.add(15) - b'0') as i64);
-            let sec = ((*ptr.add(17) - b'0') as i64) * 10 + ((*ptr.add(18) - b'0') as i64);
-            Some((base_days + day) * DAY_MS + (hour * 3600 + min * 60 + sec) * 1000)
-        }
+        parse_calendar_tail(s, base_days, None)
     }
 
     /// Fast timestamp parser utilizing `ym0_prefix` / `ym1_prefix` 8-byte match and SWAR 13-digit F3.
@@ -984,16 +1109,7 @@ impl Catalog {
             } {
                 return None;
             }
-            let day = parse_2d(s, 8)?;
-            let hour = parse_2d(s, 11)?;
-            let min = parse_2d(s, 14)?;
-            let sec = parse_2d(s, 17)?;
-            if day == 0 || day > max_day || hour > 23 || min > 59 || sec > 59 {
-                return None;
-            }
-            return Some(
-                (base_days + day as i64) * DAY_MS + ((hour * 3600 + min * 60 + sec) as i64) * 1000,
-            );
+            return parse_calendar_tail(s, base_days, Some(max_day));
         }
         if len == 13 {
             let raw8 = unsafe { (s.as_ptr() as *const u64).read_unaligned() };
@@ -1022,15 +1138,7 @@ impl Catalog {
                     } {
                         return None;
                     }
-                    let day = parse_2d(s, 8)?;
-                    let hour = parse_2d(s, 11)?;
-                    let min = parse_2d(s, 14)?;
-                    let sec = parse_2d(s, 17)?;
-                    if day == 0 || day > max_day || hour > 23 || min > 59 || sec > 59 {
-                        return None;
-                    }
-                    (base_days + day as i64) * DAY_MS
-                        + ((hour * 3600 + min * 60 + sec) as i64) * 1000
+                    parse_calendar_tail(s, base_days, Some(max_day))?
                 } else {
                     parse_civil_19(s)?
                 };
@@ -1140,26 +1248,73 @@ fn build_chunks<'a>(mmaps: &'a [MmapFile]) -> (Vec<&'a [u8]>, usize) {
     (chunks, total_bytes)
 }
 
-/// Cold-field split shard storage: `evs` is 24 bytes (`[eid, user_id, payload]`, 8-byte aligned),
-/// while `ings` (`i32` seconds) is stored in a parallel Vec that is ONLY touched when a duplicate `eid` occurs!
-#[derive(Default)]
+const PARTITION_BATCH: usize = 16;
+
+/// Buffer each partition in a small contiguous staging area. Large output
+/// pages are touched once per batch instead of once per randomly routed row.
+struct PartitionBuffer<T: Copy + Default> {
+    values: Vec<T>,
+    pending: [T; PARTITION_BATCH],
+    used: usize,
+}
+
+impl<T: Copy + Default> PartitionBuffer<T> {
+    fn with_capacity(capacity: usize) -> Self {
+        Self { values: Vec::with_capacity(capacity), pending: [T::default(); PARTITION_BATCH], used: 0 }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, value: T) {
+        self.pending[self.used] = value;
+        self.used += 1;
+        if self.used == PARTITION_BATCH { self.finish(); }
+    }
+
+    #[inline]
+    fn finish(&mut self) {
+        self.values.extend_from_slice(&self.pending[..self.used]);
+        self.used = 0;
+    }
+}
+
+impl<T: Copy + Default> std::ops::Deref for PartitionBuffer<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] { &self.values }
+}
+
+impl<'a, T: Copy + Default> IntoIterator for &'a PartitionBuffer<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter { self.values.iter() }
+}
+
 struct EventShard {
     evs: Vec<[u64; 3]>,
     ings: Vec<i32>,
+    pending_events: [[u64; 3]; PARTITION_BATCH],
+    pending_ingests: [i32; PARTITION_BATCH],
+    used: usize,
 }
 
 impl EventShard {
-    fn with_capacity(cap: usize) -> Self {
-        Self {
-            evs: Vec::with_capacity(cap),
-            ings: Vec::with_capacity(cap),
-        }
+    fn with_capacity(capacity: usize) -> Self {
+        Self { evs: Vec::with_capacity(capacity), ings: Vec::with_capacity(capacity),
+               pending_events: [[0; 3]; PARTITION_BATCH], pending_ingests: [0; PARTITION_BATCH], used: 0 }
     }
 
     #[inline(always)]
     fn push(&mut self, eid: u64, user_id: u64, payload: u64, ingest_sec: i32) {
-        self.evs.push([eid, user_id, payload]);
-        self.ings.push(ingest_sec);
+        self.pending_events[self.used] = [eid, user_id, payload];
+        self.pending_ingests[self.used] = ingest_sec;
+        self.used += 1;
+        if self.used == PARTITION_BATCH { self.finish(); }
+    }
+
+    #[inline]
+    fn finish(&mut self) {
+        self.evs.extend_from_slice(&self.pending_events[..self.used]);
+        self.ings.extend_from_slice(&self.pending_ingests[..self.used]);
+        self.used = 0;
     }
 }
 
@@ -1223,6 +1378,124 @@ fn parse_price_cents(s: &[u8]) -> Option<u32> {
     } else {
         None
     }
+}
+
+#[inline(always)]
+fn decode_event(catalog: &Catalog, fields: impl EventFields) -> Option<([u64; 3], i32)> {
+    let eid_b = fields.field(0);
+    let ing_b = fields.field(3);
+    let uid_b = fields.field(1);
+    let pid_b = fields.field(5);
+    if eid_b.is_empty() {
+        return None;
+    }
+    let Some(ingest_ts) = catalog.parse_ingest_fast(ing_b) else {
+        return None;
+    };
+    // mix64 is a bijection on u64: retaining the mixed
+    // ID preserves exact equality and avoids rehashing
+    // every event again in the dedup and prefetch loops.
+    let eid = mix64(pack7(eid_b));
+
+    let payload = 'val: {
+        if uid_b.is_empty() || pid_b.is_empty() {
+            break 'val INVALID_PAYLOAD;
+        }
+        let is_purchase = match fields.field(4) {
+            b"view" | b"cart" => false,
+            b"purchase" => true,
+            _ => break 'val INVALID_PAYLOAD,
+        };
+        let (price, cat_id) = if is_purchase {
+            let Some(p) = parse_price_cents(fields.field(6)) else {
+                break 'val INVALID_PAYLOAD;
+            };
+            (p, catalog.lookup_product_cat(pid_b))
+        } else {
+            (0u32, 0u8)
+        };
+        let Some(ts) = catalog.parse_ts_fast(fields.field(2)) else {
+            break 'val INVALID_PAYLOAD;
+        };
+        if ts < catalog.window_start || ts >= catalog.window_end {
+            break 'val INVALID_PAYLOAD;
+        }
+        if ingest_ts - ts > DAY_MS {
+            break 'val INVALID_PAYLOAD;
+        }
+        let rel_ts = (ts - catalog.base_ts) as u32;
+        ((rel_ts as u64) << 32) | ((price as u64) << 8) | (cat_id as u64)
+    };
+
+    let user_id = if payload != INVALID_PAYLOAD {
+        pack7(uid_b)
+    } else {
+        0
+    };
+    let ingest_sec = ((ingest_ts - catalog.base_ts) / 1000)
+        .clamp(i32::MIN as i64, i32::MAX as i64)
+        as i32;
+    Some(([eid, user_id, payload], ingest_sec))
+}
+
+#[inline(always)]
+fn for_each_event(chunk: &[u8], catalog: &Catalog, mut emit: impl FnMut([u64; 3], i32)) {
+    let mut pos = 0;
+    #[cfg(target_arch = "x86_64")]
+    while pos + 96 <= chunk.len() {
+        if let Some((length, fields)) = unsafe { try_parse_record_avx2::<7>(&chunk[pos..]) } {
+            pos += length + 1;
+            if let Some(fields) = fields {
+                if let Some((event, ingest)) = decode_event(catalog, fields) { emit(event, ingest); }
+            }
+        } else {
+            let rem = &chunk[pos..];
+            let length = find_nl(rem).unwrap_or(rem.len());
+            pos += length + 1;
+            if let Some(fields) = parse_csv_line_fallback::<7>(&rem[..length]) {
+                if let Some((event, ingest)) = decode_event(catalog, fields) { emit(event, ingest); }
+            }
+        }
+    }
+    if pos < chunk.len() {
+        for line in chunk[pos..].split(|&byte| byte == b'\n') {
+            if let Some(fields) = parse_csv_line_fallback::<7>(line) {
+                if let Some((event, ingest)) = decode_event(catalog, fields) { emit(event, ingest); }
+            }
+        }
+    }
+}
+
+/// Equal-time events may appear in any order. Sort only the timestamp half
+/// of each payload, using four linear passes for large people instead of
+/// comparison sorting their prices and categories too.
+fn sort_events(events: &mut [u64], scratch: &mut Vec<u64>) {
+    if events.len() < 16384 {
+        events.sort_unstable();
+        return;
+    }
+    scratch.resize(events.len(), 0);
+    fn pass(src: &[u64], dst: &mut [u64], shift: u32) {
+        let mut offsets = [0usize; 256];
+        for &event in src {
+            offsets[((event >> shift) & 255) as usize] += 1;
+        }
+        let mut sum = 0;
+        for count in &mut offsets {
+            let next = sum + *count;
+            *count = sum;
+            sum = next;
+        }
+        for &event in src {
+            let offset = &mut offsets[((event >> shift) & 255) as usize];
+            dst[*offset] = event;
+            *offset += 1;
+        }
+    }
+    pass(events, scratch, 32);
+    pass(scratch, events, 40);
+    pass(events, scratch, 48);
+    pass(scratch, events, 56);
 }
 
 fn run(data_dir: &Path, out_dir: &Path, threads: usize) -> io::Result<()> {
@@ -1309,8 +1582,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize) -> io::Result<()> {
             let next_event = &next_event;
             s.spawn(move || {
                 if t_idx == 0 {
-                    let built = CanonMap::build(thread_edges);
-                    let _ = canon_slot.set(built);
+                    canon_slot.get_or_init(|| CanonMap::build(thread_edges));
                 }
                 *c_shards = (0..NUM_SHARDS)
                     .map(|_| Vec::with_capacity(est_clicks_per_shard))
@@ -1323,63 +1595,17 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize) -> io::Result<()> {
                 while let Some(&chunk) =
                     event_chunks.get(next_event.fetch_add(1, Ordering::Relaxed))
                 {
-                    for_each_csv_record::<7>(
-                        chunk,
-                        |[eid_b, uid_b, ts_b, ing_b, etype_b, pid_b, price_b]| {
-                            if eid_b.is_empty() {
-                                return;
-                            }
-                            let Some(ingest_ts) = catalog.parse_ingest_fast(ing_b) else {
-                                return;
-                            };
-                            let eid = pack7(eid_b);
-                            let shard = (mix64(eid) as usize) & (NUM_SHARDS - 1);
-
-                            let payload = 'val: {
-                                if uid_b.is_empty() || pid_b.is_empty() {
-                                    break 'val INVALID_PAYLOAD;
-                                }
-                                let is_purchase = match etype_b {
-                                    b"view" | b"cart" => false,
-                                    b"purchase" => true,
-                                    _ => break 'val INVALID_PAYLOAD,
-                                };
-                                let (price, cat_id) = if is_purchase {
-                                    let Some(p) = parse_price_cents(price_b) else {
-                                        break 'val INVALID_PAYLOAD;
-                                    };
-                                    (p, catalog.lookup_product_cat(pid_b))
-                                } else {
-                                    (0u32, 0u8)
-                                };
-                                let Some(ts) = catalog.parse_ts_fast(ts_b) else {
-                                    break 'val INVALID_PAYLOAD;
-                                };
-                                if ts < catalog.window_start || ts >= catalog.window_end {
-                                    break 'val INVALID_PAYLOAD;
-                                }
-                                if ingest_ts - ts > DAY_MS {
-                                    break 'val INVALID_PAYLOAD;
-                                }
-                                let rel_ts = (ts - catalog.base_ts) as u32;
-                                ((rel_ts as u64) << 32) | ((price as u64) << 8) | (cat_id as u64)
-                            };
-
-                            let user_id = if payload != INVALID_PAYLOAD {
-                                pack7(uid_b)
-                            } else {
-                                0
-                            };
-                            let ingest_sec = ((ingest_ts - catalog.base_ts) / 1000)
-                                .clamp(i32::MIN as i64, i32::MAX as i64)
-                                as i32;
-                            e_shards[shard].push(eid, user_id, payload, ingest_sec);
-                        },
-                    );
+                    for_each_event(chunk, catalog, |[eid, user_id, payload], ingest| {
+                        let shard = eid as usize & (NUM_SHARDS - 1);
+                        e_shards[shard].push(eid, user_id, payload, ingest);
+                    });
                 }
 
+                for shard in e_shards.iter_mut() { shard.finish(); }
+
                 // Wait for CanonMap (already finished on Thread 0 during events parsing) and parse clicks
-                let canon_map = canon_slot.wait();
+                // get_or_init waits for the builder too, and works on Rust 1.85.
+                let canon_map = canon_slot.get_or_init(|| CanonMap::build(thread_edges));
                 while let Some(&chunk) =
                     click_chunks.get(next_click.fetch_add(1, Ordering::Relaxed))
                 {
@@ -1396,8 +1622,8 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize) -> io::Result<()> {
                         if ts < catalog.base_ts || ts >= catalog.window_end {
                             return;
                         }
-                        let person_id = canon_map.resolve(pack7(uid_b));
-                        let shard = (mix64(person_id) as usize) & (NUM_SHARDS - 1);
+                        let person_id = canon_map.resolve_hashed(pack7(uid_b));
+                        let shard = (person_id as usize) & (NUM_SHARDS - 1);
                         c_shards[shard].push(ShardedClick {
                             person_id,
                             click_id: pack7(cid_b),
@@ -1415,9 +1641,9 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize) -> io::Result<()> {
     let canon_map = canon_slot.into_inner().unwrap();
     let t_parse = t0.elapsed();
 
-    // 3. Deduplicate events per event-shard in parallel (using 16-byte DedupSlot + cold ingest_sec)
+    // 3. Deduplicate events per event-shard in parallel (8-byte slots + cold ingest seconds).
     let next_dedup_shard = AtomicUsize::new(0);
-    let mut per_thread_user_events: Vec<Vec<Vec<(u64, u64)>>> =
+    let mut per_thread_user_events: Vec<Vec<PartitionBuffer<(u64, u64)>>> =
         (0..threads).map(|_| Vec::new()).collect();
 
     thread::scope(|s| {
@@ -1427,7 +1653,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize) -> io::Result<()> {
             let next_dedup_shard = &next_dedup_shard;
             s.spawn(move || {
                 *out_user_shards = (0..NUM_SHARDS)
-                    .map(|_| Vec::with_capacity(est_events_per_shard))
+                    .map(|_| PartitionBuffer::with_capacity(est_events_per_shard))
                     .collect();
 
                 let mut ht_cap = 1usize << 16;
@@ -1469,12 +1695,12 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize) -> io::Result<()> {
                             #[cfg(target_arch = "x86_64")]
                             if i + 12 < slen {
                                 let feid = unsafe { evs.get_unchecked(i + 12)[0] };
-                                let fidx = ((mix64(feid) >> SHARD_SHIFT) as usize) & mask;
+                                let fidx = ((feid >> SHARD_SHIFT) as usize) & mask;
                                 unsafe {
                                     _mm_prefetch(ht.as_ptr().add(fidx) as *const i8, _MM_HINT_T0);
                                 }
                             }
-                            let h = mix64(eid);
+                            let h = eid;
                             let tag = (h >> 48) as u16;
                             let mut idx = ((h >> SHARD_SHIFT) as usize) & mask;
                             loop {
@@ -1534,8 +1760,8 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize) -> io::Result<()> {
                                         .prefetch(unsafe { evs.get_unchecked(i + 16)[1] });
                                 }
                                 if payload != INVALID_PAYLOAD {
-                                    let person_id = canon_map.resolve(user_id);
-                                    let u_shard = (mix64(person_id) as usize) & (NUM_SHARDS - 1);
+                                    let person_id = canon_map.resolve_hashed(user_id);
+                                    let u_shard = (person_id as usize) & (NUM_SHARDS - 1);
                                     out_user_shards[u_shard].push((person_id, payload));
                                 }
                             }
@@ -1553,14 +1779,15 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize) -> io::Result<()> {
                                 if payload != INVALID_PAYLOAD
                                     && (kw[i >> 6] & (1u64 << (i & 63))) == 0
                                 {
-                                    let person_id = canon_map.resolve(user_id);
-                                    let u_shard = (mix64(person_id) as usize) & (NUM_SHARDS - 1);
+                                    let person_id = canon_map.resolve_hashed(user_id);
+                                    let u_shard = (person_id as usize) & (NUM_SHARDS - 1);
                                     out_user_shards[u_shard].push((person_id, payload));
                                 }
                             }
                         }
                     }
                 }
+                for shard in out_user_shards.iter_mut() { shard.finish(); }
             });
         }
     });
@@ -1589,7 +1816,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize) -> io::Result<()> {
             let next_user_shard = &next_user_shard;
             s.spawn(move || {
                 u_rows_out.reserve(est_events_per_shard * NUM_SHARDS / 6);
-                let mut ht_cap = 1usize << 14;
+                let mut ht_cap = 1024usize;
                 let mut ht: Vec<UserSlot> = vec![UserSlot::default(); ht_cap];
                 let mut cur_gen: u16 = 0;
 
@@ -1602,6 +1829,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize) -> io::Result<()> {
                 let mut resolved_ev_uidx: Vec<u32> = Vec::new();
                 let mut resolved_clicks: Vec<(u32, UserClick)> = Vec::new();
                 let mut csr_events: Vec<u64> = Vec::new();
+                let mut sort_scratch: Vec<u64> = Vec::new();
                 let mut csr_clicks: Vec<UserClick> = Vec::new();
 
                 let mut seen_camp_stamp = vec![0u32; num_camps];
@@ -1624,13 +1852,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize) -> io::Result<()> {
                     if total_ev == 0 {
                         continue;
                     }
-                    // Each person has ~30 events on average; size ht for unique users (fits in L2 cache!)
-                    let needed_cap = (total_ev / 4).next_power_of_two().max(1 << 13);
-                    if needed_cap > ht_cap {
-                        ht_cap = needed_cap;
-                        ht = vec![UserSlot::default(); ht_cap];
-                        cur_gen = 0;
-                    }
+                    // Size this table by distinct people, not whale event counts.
                     cur_gen = cur_gen.wrapping_add(1);
                     if cur_gen == 0 {
                         for slot in &mut ht {
@@ -1657,7 +1879,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize) -> io::Result<()> {
                                 ht = vec![UserSlot::default(); ht_cap];
                                 cur_gen = 1;
                                 for (u_i, &existing_pid) in user_ids.iter().enumerate() {
-                                    let eh = mix64(existing_pid);
+                                    let eh = existing_pid;
                                     let etag = (eh >> 48) as u16;
                                     let mut eidx = ((eh >> SHARD_SHIFT) as usize) & mask;
                                     loop {
@@ -1672,7 +1894,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize) -> io::Result<()> {
                                     }
                                 }
                             }
-                            let h = mix64(pid);
+                            let h = pid;
                             let tag = (h >> 48) as u16;
                             let mut idx = ((h >> SHARD_SHIFT) as usize) & mask;
                             let uidx = loop {
@@ -1702,7 +1924,7 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize) -> io::Result<()> {
                     // Pass 2: match clicks against users with events and cache (uidx, UserClick)
                     for t_vec in per_thread_clicks {
                         for cl in &t_vec[shard] {
-                            let h = mix64(cl.person_id);
+                            let h = cl.person_id;
                             let tag = (h >> 48) as u16;
                             let mut idx = ((h >> SHARD_SHIFT) as usize) & mask;
                             loop {
@@ -1782,13 +2004,13 @@ fn run(data_dir: &Path, out_dir: &Path, threads: usize) -> io::Result<()> {
                     }
 
                     for u in 0..num_users {
-                        let pid = user_ids[u];
+                        let pid = unmix64(user_ids[u]);
                         let u_evs = &mut csr_events
                             [ev_offsets[u] as usize..ev_offsets[u + 1] as usize];
                         let u_cls = &mut csr_clicks
                             [cl_offsets[u] as usize..cl_offsets[u + 1] as usize];
 
-                        u_evs.sort_unstable();
+                        sort_events(u_evs, &mut sort_scratch);
                         if u_cls.len() > 1 {
                             u_cls.sort_unstable_by(|a, b| {
                                 a.rel_ts
@@ -2098,5 +2320,177 @@ fn main() {
             eprintln!("shopping-sessions error: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mixed_id_roundtrip_and_canonical_chains() {
+        for key in [0,u64::MAX,1,1<<63].into_iter().chain((0..100000).map(mix64)) {
+            assert_eq!(unmix64(mix64(key)),key);
+        }
+        let a=pack7(b"a"); let b=pack7(b"b"); let c=pack7(b"c"); let d=pack7(b"d");
+        let map=CanonMap::build(&[vec![(b,c),(a,b),(c,c)]]);
+        for key in [a,b,c] { assert_eq!(map.resolve_hashed(key),mix64(a)); }
+        assert_eq!(map.resolve_hashed(d),mix64(d));
+        assert_eq!(CanonMap::build(&[]).resolve_hashed(d),mix64(d));
+    }
+
+    #[test]
+    fn quote_prefix_matches_bitwise_parity() {
+        for input in [0, u64::MAX, 1, 1 << 63].into_iter().chain((0..1000).map(mix64)) {
+            let mut expected = 0u64;
+            let mut parity = 0u64;
+            for bit in 0..64 {
+                parity ^= (input >> bit) & 1;
+                expected |= parity << bit;
+            }
+            assert_eq!(quote_prefix(input), expected);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn exhaustive_quote_edges_match_scalar() {
+        if !std::is_x86_feature_detected!("avx2") { return; }
+        fn check<const N: usize>(line: &[u8]) {
+            let expected = parse_csv_line_fallback::<N>(line);
+            let mut input = line.to_vec();
+            input.push(b'\n'); input.resize(input.len().max(96), b'x');
+            let actual = unsafe { try_parse_record_avx2::<N>(&input) }
+                .map(|(length, fields)| (length, fields.map(|fields| fields.to_array())));
+            assert_eq!(actual, Some((line.len(), expected)), "{line:?}");
+        }
+        for length in 0..=9u32 {
+            for mut pattern in 0..3u32.pow(length) {
+                let mut text = Vec::new();
+                for _ in 0..length {
+                    text.push([b'a', b',', b'"'][(pattern % 3) as usize]);
+                    pattern /= 3;
+                }
+                for padding in [0, 60, 63, 64, 86] {
+                    let mut line = vec![b'x'; padding]; line.extend_from_slice(&text);
+                    check::<2>(&line); check::<4>(&line); check::<7>(&line);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partition_batches_preserve_rows_and_ingest_alignment() {
+        for count in [0, 1, 15, 16, 17, 31, 32, 1001] {
+            let mut events = EventShard::with_capacity(1);
+            let mut people = PartitionBuffer::with_capacity(1);
+            for row in 0..count {
+                events.push(row, row + 100, row + 200, row as i32 - 50);
+                people.push((row, row + 100));
+            }
+            events.finish(); people.finish();
+            events.finish(); people.finish();
+            assert_eq!(events.evs.len(), count as usize);
+            assert_eq!(events.ings.len(), count as usize);
+            assert_eq!(people.len(), count as usize);
+            for row in 0..count as usize {
+                assert_eq!(events.evs[row], [row as u64, row as u64 + 100, row as u64 + 200]);
+                assert_eq!(events.ings[row], row as i32 - 50);
+                assert_eq!(people[row], (row as u64, row as u64 + 100));
+            }
+        }
+    }
+
+    #[test]
+    fn packed_ids_preserve_bytes_and_order() {
+        let mut ids = Vec::new();
+        for len in 1..=9 {
+            for byte in [b' ', b'0', b'A', b'Z', b'a', b'z', b'\r'] {
+                let id = vec![byte; len];
+                let mut decoded = [0; 9];
+                let decoded_len = parquet::unpack7(pack7(&id), &mut decoded);
+                assert_eq!(&decoded[..decoded_len], id);
+                ids.push(id);
+            }
+        }
+        ids.sort();
+        assert!(ids.windows(2).all(|pair| pack7(&pair[0]) < pack7(&pair[1])));
+    }
+
+    #[test]
+    fn vector_calendar_tail_matches_scalar() {
+        let original = *b"2028-02-29T23:58:47Z";
+        let base = days_from_civil_const(2028,2,1) - 1;
+        assert_eq!(parse_calendar_tail(&original,base,Some(29)), parse_civil_19(&original));
+        for index in [8,9,11,12,14,15,17,18] {
+            for byte in 0..=255 {
+                let mut timestamp = original; timestamp[index] = byte;
+                assert_eq!(parse_calendar_tail(&timestamp,base,Some(29)), parse_civil_19(&timestamp), "{index} {byte}");
+            }
+        }
+        for day in 1..=29 { for hour in 0..24 { for minute in 0..60 {
+            let timestamp = format!("2028-02-{day:02}T{hour:02}:{minute:02}:47Z");
+            assert_eq!(parse_calendar_tail(timestamp.as_bytes(),base,None), parse_civil_19(timestamp.as_bytes()));
+        }}}
+    }
+
+    #[test]
+    fn timestamp_digit_gather_matches_scalar() {
+        let original = b"2028-02-29T23:58:47Z";
+        let scalar = |s: &[u8]| -> Option<(u32, u32, u32, u32)> {
+            Some((parse_2d(s, 8)?, parse_2d(s, 11)?, parse_2d(s, 14)?, parse_2d(s, 17)?))
+        };
+        assert_eq!(parse_day_hms(original), Some((29, 23, 58, 47)));
+        for index in [8, 9, 11, 12, 14, 15, 17, 18] {
+            for byte in 0..=255 {
+                let mut timestamp = *original;
+                timestamp[index] = byte;
+                assert_eq!(parse_day_hms(&timestamp), scalar(&timestamp), "index {index}, byte {byte}");
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn check_csv<const N: usize>() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let fields: &[&[u8]] = &[
+            b"", b"a", b"\"", b"\"\"", b"\"a\"", b"a\"", b"\"a",
+            b"a\"b", b"\"a\"x", b"\r", b" a ", "\u{00e9}".as_bytes(),
+        ];
+        for seed in 0..4000u64 {
+            let mut line = Vec::new();
+            for column in 0..N {
+                if column > 0 {
+                    line.push(b',');
+                }
+                let field = fields[(mix64(seed * N as u64 + column as u64)
+                    % fields.len() as u64) as usize];
+                line.extend_from_slice(field);
+            }
+            // Move delimiters/quotes through both SIMD-mask boundaries.
+            let padding = (seed % 110) as usize;
+            line.splice(0..0, std::iter::repeat(b'x').take(padding));
+            let expected = parse_csv_line_fallback::<N>(&line);
+            let mut input = line.clone();
+            input.push(b'\n');
+            input.resize(input.len().max(96), b'x');
+            let actual = unsafe { try_parse_record_avx2::<N>(&input) }
+                .map(|(length, fields)| (length, fields.map(|fields| fields.to_array())));
+            if line.len() < 96 {
+                assert_eq!(actual, Some((line.len(), expected)), "{line:?}");
+            } else {
+                assert_eq!(actual, None);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn simd_csv_matches_scalar_validation() {
+        check_csv::<2>();
+        check_csv::<4>();
+        check_csv::<7>();
     }
 }
