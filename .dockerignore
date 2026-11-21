@@ -1,0 +1,12 @@
+fixtures/
+dev/
+dev-answer/
+generator/
+starter-duckdb/
+starter-polars/
+starter-pyspark/
+*.zip
+out/
+target/
+*.md
+.git

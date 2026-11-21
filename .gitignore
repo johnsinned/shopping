@@ -1,0 +1,13 @@
+/target/
+/dev/
+/dev-answer/
+/generator/
+/starter-duckdb/
+/starter-polars/
+/starter-pyspark/
+/out/
+/out_dev/
+/out_fx/
+/*.zip
+/__pycache__/
+/scripts/__pycache__/
